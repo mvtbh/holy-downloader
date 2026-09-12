@@ -39,7 +39,7 @@ on:
         default: true
         type: boolean
       enable_warp_proxy:
-        description: 'Use Cloudflare WARP SOCKS5 proxy for YouTube extractor requests'
+        description: 'Use Cloudflare WARP'
         required: false
         default: true
         type: boolean
