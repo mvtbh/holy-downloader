@@ -1,0 +1,1398 @@
+name: Download From URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated list of URLs to download'
+        required: true
+        type: string
+      mode:
+        description: 'Download mode'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+      split_threshold_mb:
+        description: 'Split files larger than this MB (0 = never split)'
+        required: false
+        default: 90
+        type: number
+      max_parallel_downloads:
+        description: 'How many files to download in parallel'
+        required: false
+        default: 3
+        type: number
+      video_quality:
+        description: 'Video quality fallback for extractor downloads'
+        required: false
+        default: '720'
+        type: choice
+        options:
+          - '360'
+          - '480'
+          - '720'
+          - '1080'
+          - best
+      format_selection:
+        description: 'Extractor output format'
+        required: false
+        default: '720p'
+        type: choice
+        options:
+          - best
+          - best-video
+          - best-audio
+          - 360p
+          - 480p
+          - 720p
+          - 1080p
+          - mp4
+          - webm
+          - mp3
+          - m4a
+          - flac
+      package_output:
+        description: 'Create easy-download archives after download'
+        required: false
+        default: 'site-zip'
+        type: choice
+        options:
+          - none
+          - site-zip
+          - user-zip
+      request_timeout_seconds:
+        description: 'Max seconds per file download attempt'
+        required: false
+        default: 1800
+        type: number
+      fail_fast_after:
+        description: 'Stop run after this many failed URLs (0 disables)'
+        required: false
+        default: 5
+        type: number
+      cleanup_mode:
+        description: 'After packaging, optionally keep only archives'
+        required: false
+        default: 'keep-all'
+        type: choice
+        options:
+          - keep-all
+          - archives-only
+      skip_existing_by_filename:
+        description: 'Skip when same filename already exists in target site folder'
+        required: false
+        default: true
+        type: boolean
+      enable_warp_proxy:
+        description: 'Use Cloudflare WARP SOCKS5 proxy for YouTube extractor requests'
+        required: false
+        default: true
+        type: boolean
+      zip_password:
+        description: 'Optional password for generated zip archives'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  save-file:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install aria2 and zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip ffmpeg git
+          python3 -m pip install -q --upgrade "yt-dlp[default]" yt-dlp-ejs youtube-dl gallery-dl spotdl bgutil-ytdlp-pot-provider
+          BGUTIL_HOME="${RUNNER_TEMP}/bgutil-ytdlp-pot-provider"
+          rm -rf "$BGUTIL_HOME"
+          git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git "$BGUTIL_HOME"
+          (
+            cd "$BGUTIL_HOME/server"
+            npm ci --silent
+            npx tsc
+          )
+          echo "BGUTIL_SERVER_HOME=$BGUTIL_HOME/server" >> "$GITHUB_ENV"
+
+      - name: Download files
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_URLS: ${{ github.event.inputs.urls }}
+          INPUT_SPLIT_THRESHOLD_MB: ${{ github.event.inputs.split_threshold_mb }}
+          INPUT_MAX_PARALLEL_DOWNLOADS: ${{ github.event.inputs.max_parallel_downloads }}
+          INPUT_VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
+          INPUT_FORMAT_SELECTION: ${{ github.event.inputs.format_selection }}
+          INPUT_PACKAGE_OUTPUT: ${{ github.event.inputs.package_output }}
+          INPUT_REQUEST_TIMEOUT_SECONDS: ${{ github.event.inputs.request_timeout_seconds }}
+          INPUT_FAIL_FAST_AFTER: ${{ github.event.inputs.fail_fast_after }}
+          INPUT_CLEANUP_MODE: ${{ github.event.inputs.cleanup_mode }}
+          INPUT_SKIP_EXISTING_BY_FILENAME: ${{ github.event.inputs.skip_existing_by_filename }}
+          INPUT_ENABLE_WARP_PROXY: ${{ github.event.inputs.enable_warp_proxy }}
+          INPUT_ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+          INPUT_YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          INPUT_YOUTUBE_PO_TOKEN: ${{ secrets.YOUTUBE_PO_TOKEN }}
+          INPUT_BGUTIL_SERVER_HOME: ${{ env.BGUTIL_SERVER_HOME }}
+          INPUT_SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          INPUT_SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+        run: |
+          MODE="${INPUT_MODE}"
+          URLS="${INPUT_URLS}"
+          SPLIT_THRESHOLD_MB="${INPUT_SPLIT_THRESHOLD_MB}"
+          MAX_PARALLEL_DOWNLOADS="${INPUT_MAX_PARALLEL_DOWNLOADS}"
+          MAX_CONNECTIONS_PER_FILE=8
+          VIDEO_QUALITY="${INPUT_VIDEO_QUALITY:-720}"
+          FORMAT_SELECTION="${INPUT_FORMAT_SELECTION:-720p}"
+          PACKAGE_OUTPUT="${INPUT_PACKAGE_OUTPUT}"
+          REQUEST_TIMEOUT_SECONDS="${INPUT_REQUEST_TIMEOUT_SECONDS}"
+          if ! printf '%s\n' "${REQUEST_TIMEOUT_SECONDS:-}" | grep -Eq '^[0-9]+$'; then
+            REQUEST_TIMEOUT_SECONDS=60
+          fi
+          if [ "$REQUEST_TIMEOUT_SECONDS" -lt 1 ]; then
+            REQUEST_TIMEOUT_SECONDS=1
+          fi
+          if [ "$REQUEST_TIMEOUT_SECONDS" -gt 600 ]; then
+            echo "Requested timeout ${REQUEST_TIMEOUT_SECONDS} exceeds aria2 maximum (600). Capping to 600."
+            REQUEST_TIMEOUT_SECONDS=600
+          fi
+          FAIL_FAST_AFTER="${INPUT_FAIL_FAST_AFTER}"
+          CLEANUP_MODE="${INPUT_CLEANUP_MODE}"
+          SKIP_EXISTING_BY_FILENAME="${INPUT_SKIP_EXISTING_BY_FILENAME}"
+          ENABLE_WARP_PROXY="${INPUT_ENABLE_WARP_PROXY:-true}"
+          ZIP_PASSWORD="${INPUT_ZIP_PASSWORD:-}"
+          GITHUB_MAX_FILE_MB=95
+          GITHUB_MAX_FILE_BYTES=$(( GITHUB_MAX_FILE_MB * 1024 * 1024 ))
+          ZIP_SECURITY_ARGS=()
+          ZIP_SPLIT_ARGS=(-s "${GITHUB_MAX_FILE_MB}m")
+          if [ -n "$ZIP_PASSWORD" ]; then
+            ZIP_SECURITY_ARGS=(-P "$ZIP_PASSWORD")
+          fi
+          LARGE_FILE_THRESHOLD_MB=1024
+          LARGE_FILE_CONNECTIONS=4
+          ADAPTIVE_CONNECTIONS=true
+          ENABLE_MIRROR_FALLBACK=true
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+          LARGE_FILE_THRESHOLD_BYTES=$(( LARGE_FILE_THRESHOLD_MB * 1024 * 1024 ))
+          ACTOR="${GITHUB_ACTOR:?GITHUB_ACTOR is not set}"
+          ACTOR_SAFE=$(echo "$ACTOR" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g')
+          USER_ROOT="downloads/$ACTOR_SAFE"
+          RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          RUN_DIR="${RUNNER_TEMP:-/tmp}/download-run-$RUN_TS"
+          HEAD_CACHE_DIR="${RUNNER_TEMP:-/tmp}/download-headers-$RUN_TS"
+          MANIFEST_FILE="$RUN_DIR/manifest.jsonl"
+          COOKIE_FILE="$RUN_DIR/youtube_cookies.txt"
+          EXTRACTOR_COOKIE_ARGS=()
+          YTDLP_JS_RUNTIMES="deno"
+          YTDLP_CMD=(python3 -m yt_dlp)
+          YOUTUBE_PO_TOKEN="${INPUT_YOUTUBE_PO_TOKEN:-}"
+          BGUTIL_SERVER_HOME="${INPUT_BGUTIL_SERVER_HOME:-}"
+          SPOTIFY_CLIENT_ID="${INPUT_SPOTIFY_CLIENT_ID:-}"
+          SPOTIFY_CLIENT_SECRET="${INPUT_SPOTIFY_CLIENT_SECRET:-}"
+          BGUTIL_BASE_URL="http://127.0.0.1:4416"
+          BGUTIL_SERVER_PID=""
+          WARP_CONTAINER_NAME=""
+          WARP_STARTED=0
+          YTDLP_PROXY_ARGS=()
+
+          mkdir -p "$USER_ROOT" "$RUN_DIR" "$HEAD_CACHE_DIR"
+          : > "$MANIFEST_FILE"
+          cleanup() {
+            rm -f "$COOKIE_FILE"
+            if [ -n "$BGUTIL_SERVER_PID" ] && kill -0 "$BGUTIL_SERVER_PID" 2>/dev/null; then
+              kill "$BGUTIL_SERVER_PID" 2>/dev/null || true
+            fi
+            if [ -n "$WARP_CONTAINER_NAME" ]; then
+              docker stop "$WARP_CONTAINER_NAME" >/dev/null 2>&1 || true
+              docker rm "$WARP_CONTAINER_NAME" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          RAW_COOKIES_TEXT="${INPUT_YOUTUBE_COOKIES:-}"
+          if [ -n "$RAW_COOKIES_TEXT" ]; then
+            printf '%s\n' "$RAW_COOKIES_TEXT" > "$COOKIE_FILE"
+          fi
+
+          if [ -s "$COOKIE_FILE" ]; then
+            tr -d '\r' < "$COOKIE_FILE" > "${COOKIE_FILE}.tmp" && mv "${COOKIE_FILE}.tmp" "$COOKIE_FILE"
+            if ! awk -F '\t' 'BEGIN{ok=0} /^[^#]/ {if (NF>=7) ok=1} END{exit ok?0:1}' "$COOKIE_FILE"; then
+              python3 -c $'import json\nimport sys\nfrom pathlib import Path\np = Path(sys.argv[1])\nraw = p.read_text(encoding="utf-8", errors="ignore").strip()\nif not raw or raw[:1] not in ("{", "["):\n    raise SystemExit(0)\nparsed = json.loads(raw)\ncookies = parsed if isinstance(parsed, list) else parsed.get("cookies", []) if isinstance(parsed, dict) else []\nout = ["# Netscape HTTP Cookie File"]\nfor c in cookies:\n    if not isinstance(c, dict):\n        continue\n    name = c.get("name")\n    value = c.get("value")\n    if not name or value is None:\n        continue\n    domain = c.get("domain") or ".youtube.com"\n    path = c.get("path") or "/"\n    host_only = str(c.get("hostOnly")).lower() == "true" if c.get("hostOnly") is not None else False\n    secure = "TRUE" if str(c.get("secure")).lower() == "true" else "FALSE"\n    expiry = c.get("expirationDate") or c.get("expires") or c.get("expiry") or 0\n    try:\n        expiry = str(int(float(expiry)))\n    except Exception:\n        expiry = "0"\n    include_subdomains = "TRUE" if str(domain).startswith(".") or not host_only else "FALSE"\n    out.append(f"{domain}\\t{include_subdomains}\\t{path}\\t{secure}\\t{expiry}\\t{name}\\t{value}")\nif len(out) > 1:\n    p.write_text("\\n".join(out) + "\\n", encoding="utf-8")' "$COOKIE_FILE" || true
+            fi
+            chmod 600 "$COOKIE_FILE"
+            EXTRACTOR_COOKIE_ARGS=(--cookies "$COOKIE_FILE")
+            if ! awk -F '\t' 'BEGIN{ok=0} /^[^#]/ {if (NF>=7) ok=1} END{exit ok?0:1}' "$COOKIE_FILE"; then
+              echo "YOUTUBE_COOKIES does not look like Netscape cookies.txt format"
+            fi
+            if ! grep -qiE 'youtube\.com|\.youtube\.com' "$COOKIE_FILE"; then
+              echo "YOUTUBE_COOKIES does not contain youtube.com cookies"
+            fi
+          fi
+
+          if command -v deno >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+            YTDLP_JS_RUNTIMES="deno:$(command -v deno),node:$(command -v node)"
+          elif command -v deno >/dev/null 2>&1; then
+            YTDLP_JS_RUNTIMES="deno:$(command -v deno)"
+          elif command -v node >/dev/null 2>&1; then
+            YTDLP_JS_RUNTIMES="node:$(command -v node)"
+          elif command -v nodejs >/dev/null 2>&1; then
+            YTDLP_JS_RUNTIMES="node:$(command -v nodejs)"
+          fi
+          if [ -n "$BGUTIL_SERVER_HOME" ] && [ -d "$BGUTIL_SERVER_HOME" ]; then
+            if [ -f "$BGUTIL_SERVER_HOME/build/main.js" ]; then
+              BGUTIL_SERVER_LOG="$RUN_DIR/bgutil-server.log"
+              node "$BGUTIL_SERVER_HOME/build/main.js" >"$BGUTIL_SERVER_LOG" 2>&1 &
+              BGUTIL_SERVER_PID=$!
+              sleep 2
+              if kill -0 "$BGUTIL_SERVER_PID" 2>/dev/null; then
+                :
+              else
+                BGUTIL_SERVER_PID=""
+                echo "bgutil HTTP provider did not start; falling back to script provider"
+              fi
+            fi
+          fi
+
+          maybe_start_warp_proxy() {
+            [ "$ENABLE_WARP_PROXY" = "true" ] || return 1
+            printf '%s\n' "$URLS" | grep -qiE '(youtube\.com|youtu\.be|music\.youtube\.com)' || return 1
+            command -v docker >/dev/null 2>&1 || return 1
+
+            echo "Starting Cloudflare WARP proxy for YouTube..."
+            docker network create warp-net >/dev/null 2>&1 || true
+            WARP_CONTAINER_NAME="warp-ytdlp-${RANDOM}-${RANDOM}"
+
+            if ! docker run -d \
+              --name "$WARP_CONTAINER_NAME" \
+              --restart=unless-stopped \
+              --network warp-net \
+              -p 1080:1080 \
+              --cap-add NET_ADMIN \
+              --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+              --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+              -v warp-data:/var/lib/cloudflare-warp \
+              caomingjun/warp >/dev/null; then
+              echo "Failed to start WARP container; continuing without WARP proxy"
+              WARP_CONTAINER_NAME=""
+              return 1
+            fi
+
+            sleep 20
+            local i
+            for i in 1 2 3 4 5 6; do
+              if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE 'warp=(on|plus)'; then
+                WARP_STARTED=1
+                YTDLP_PROXY_ARGS=(--proxy "socks5://127.0.0.1:1080")
+                return 0
+              fi
+              sleep 5
+            done
+
+            echo "WARP proxy is not ready; continuing without WARP proxy"
+            docker stop "$WARP_CONTAINER_NAME" >/dev/null 2>&1 || true
+            docker rm "$WARP_CONTAINER_NAME" >/dev/null 2>&1 || true
+            WARP_CONTAINER_NAME=""
+            return 1
+          }
+          maybe_start_warp_proxy || true
+
+          if [ -n "$SPOTIFY_CLIENT_ID" ] && [ -n "$SPOTIFY_CLIENT_SECRET" ]; then
+            export SPOTIPY_CLIENT_ID="$SPOTIFY_CLIENT_ID"
+            export SPOTIPY_CLIENT_SECRET="$SPOTIFY_CLIENT_SECRET"
+          else
+            echo "No Spotify app credentials configured; spotdl will use shared defaults (can hit 24h rate limits)"
+          fi
+
+          normalize_domain() {
+            local raw_url="$1"
+            local host
+            host=$(echo "$raw_url" | sed -E 's#^[a-zA-Z]+://##' | cut -d/ -f1 | cut -d: -f1)
+            host=$(echo "$host" | sed 's/^www\.//')
+            echo "$host" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.-]+/-/g'
+          }
+
+          next_site_folder() {
+            local base_dir="$1"
+            local site_name="$2"
+            local candidate="$base_dir/$site_name"
+            local suffix=2
+
+            while [ -e "$candidate" ]; do
+              candidate="$base_dir/$site_name-$suffix"
+              suffix=$((suffix + 1))
+            done
+            echo "$candidate"
+          }
+
+          url_key() {
+            local raw_url="$1"
+            printf '%s' "$raw_url" | sha256sum | awk '{print $1}'
+          }
+
+          read_header_value() {
+            local key="$1"
+            local header_file="$2"
+            [ -f "$header_file" ] || return 0
+            sed -n -E "s/^${key}:[[:space:]]*(.*)$/\1/ip" "$header_file" | tail -n1 | tr -d '\r'
+          }
+
+          is_http_url() {
+            local u="$1"
+            case "$u" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          resolve_output_name() {
+            local dir="$1"
+            local name="$2"
+            local target="$dir/$name"
+            local stem ext candidate idx
+            if [ ! -f "$target" ]; then
+              echo "$name"
+              return 0
+            fi
+
+            stem="${name%.*}"
+            ext="${name##*.}"
+            if [ "$stem" = "$ext" ]; then
+              ext=""
+            else
+              ext=".$ext"
+            fi
+            idx=2
+            candidate="$name"
+            while [ -f "$dir/$candidate" ]; do
+              candidate="${stem}-${idx}${ext}"
+              idx=$((idx + 1))
+            done
+            echo "$candidate"
+          }
+
+          is_content_type_file() {
+            local content_type="$1"
+            if printf "%s\n" "$content_type" | grep -qiE "^text/html"; then
+              return 1
+            fi
+            if printf "%s\n" "$content_type" | grep -qiE "^(audio|video)/"; then
+              return 0
+            fi
+            if printf "%s\n" "$content_type" | grep -qiE "^application/" && ! printf "%s\n" "$content_type" | grep -qiE "(javascript|json|xml|xhtml)"; then
+              return 0
+            fi
+            if printf "%s\n" "$content_type" | grep -qiE "^(image|font)/"; then
+              return 0
+            fi
+            return 1
+          }
+
+          is_url_file_by_path() {
+            local url="$1"
+            if printf "%s\n" "$url" | grep -qiE '\.(zip|7z|rar|tar|gz|bz2|xz|zst|iso|apk|exe|msi|dmg|deb|rpm|appimage|pkg|jar|war|pdf|epub|txt|csv|json|xml|ya?ml|toml|ini|sqlite|db|bin|img|torrent|mp3|wav|flac|ogg|m4a|aac|opus|webm|mp4|m4v|mov|avi|mkv|wmv|png|jpg|jpeg|gif|webp|svg|heic|ico)(\?|$)'; then
+              return 0
+            fi
+            return 1
+          }
+
+          is_likely_file() {
+            local url="$1"
+            local content_type="$2"
+            if is_url_file_by_path "$url"; then
+              return 0
+            fi
+            if is_content_type_file "$content_type"; then
+              return 0
+            fi
+            return 1
+          }
+
+          is_html_file() {
+            local file_path="$1"
+            [ -f "$file_path" ] || return 1
+
+            if file -b --mime-type "$file_path" 2>/dev/null | grep -qi '^text/html$'; then
+              return 0
+            fi
+
+            if head -c 4096 "$file_path" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -qE '<!doctype html|<html|<head|<body'; then
+              return 0
+            fi
+
+            return 1
+          }
+
+          is_extractor_domain() {
+            local url="$1"
+            local domain
+            domain=$(echo "$url" | sed -E 's#^[a-zA-Z]+://##' | cut -d/ -f1 | sed 's/^www\.//' | tr '[:upper:]' '[:lower:]')
+            case "$domain" in
+              youtube.com|youtu.be|music.youtube.com|vimeo.com|dailymotion.com|twitch.tv|kick.com|tiktok.com|instagram.com|twitter.com|x.com|facebook.com|fb.watch|reddit.com|streamable.com|bilibili.com|nicovideo.jp|soundcloud.com|bandcamp.com|mixcloud.com|audiomack.com|spotify.com|open.spotify.com|deezer.com|vk.com)
+                return 0 ;;
+              *)
+                return 1 ;;
+            esac
+          }
+
+          is_fileditchfiles_url() {
+            local url="$1"
+            [[ "$url" =~ fileditchfiles\.me ]]
+          }
+
+          extract_fileditchfiles_url() {
+            local url="$1"
+            local tmp_dir="$2"
+            local response_file="$tmp_dir/fileditchfiles_response.html"
+            local headers_file="$tmp_dir/fileditchfiles_headers.txt"
+
+            if ! curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+              --connect-timeout 10 --max-time 30 \
+              -D "$headers_file" \
+              "$url" > "$response_file" 2>/dev/null; then
+              return 1
+            fi
+
+            local extracted_url
+            extracted_url=$(grep -i '^Location:' "$headers_file" | tail -1 | cut -d' ' -f2- | tr -d '\r\n')
+            if [ -n "$extracted_url" ]; then
+              echo "$extracted_url"
+              return 0
+            fi
+
+            extracted_url=$(grep -oP '(?<=<meta\s+http-equiv=["'"'"']?refresh["'"'"']?\s+content=["'"'"']?[^"'"'"']*?url=)([^"'"'"'\s>]+)' "$response_file" | head -1)
+            if [ -n "$extracted_url" ]; then
+              echo "$extracted_url"
+              return 0
+            fi
+
+            extracted_url=$(grep -oP '(?<=window\.location\s*=\s*["\047])([^"\047]+)(?=["\047])' "$response_file" | head -1)
+            if [ -n "$extracted_url" ]; then
+              echo "$extracted_url"
+              return 0
+            fi
+
+            extracted_url=$(grep -oP 'href="([^"]*(?:download|get|file|dl|stream)[^"]*)"|src="([^"]*(?:download|get|file|dl|stream)[^"]*)"' "$response_file" | cut -d'"' -f2 | grep -v '^$' | head -1)
+            if [ -n "$extracted_url" ]; then
+              echo "$extracted_url"
+              return 0
+            fi
+
+            return 1
+          }
+
+          try_fileditchfiles_download() {
+            local target_url="$1"
+            local tmp_dir="$2"
+            local id_tag="$3"
+            local extracted_url=""
+
+            extracted_url=$(extract_fileditchfiles_url "$target_url" "$tmp_dir")
+            if [ -z "$extracted_url" ]; then
+              return 1
+            fi
+
+            if [[ "$extracted_url" != http* ]]; then
+              if [[ "$extracted_url" =~ ^/ ]]; then
+                extracted_url="https://fileditchfiles.me${extracted_url}"
+              else
+                extracted_url="https://fileditchfiles.me/${extracted_url}"
+              fi
+            fi
+
+            echo "Extracted fileditchfiles URL: $extracted_url" >&2
+
+            if aria2c -q --connect-timeout=10 --timeout=30 \
+              --max-connection-per-server=4 \
+              --file-allocation=falloc \
+              --dir="$tmp_dir" \
+              "$extracted_url" 2>/dev/null; then
+              local downloaded_file
+              downloaded_file=$(find "$tmp_dir" -maxdepth 1 -type f \
+                ! -name "*.html" \
+                ! -name "*_headers.txt" \
+                ! -name "*_response.*" \
+                ! -name "*.tmp" \
+                ! -name "*.part" \
+                -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+              if [ -n "$downloaded_file" ] && [ -f "$downloaded_file" ]; then
+                echo "$downloaded_file"
+                return 0
+              fi
+            fi
+
+            return 1
+          }
+
+          is_spotify_url() {
+            local url="$1"
+            local domain
+            domain=$(echo "$url" | sed -E 's#^[a-zA-Z]+://##' | cut -d/ -f1 | sed 's/^www\.//' | tr '[:upper:]' '[:lower:]')
+            case "$domain" in
+              spotify.com|open.spotify.com)
+                return 0 ;;
+              *)
+                return 1 ;;
+            esac
+          }
+
+          is_youtube_url() {
+            local url="$1"
+            local domain
+            domain=$(echo "$url" | sed -E 's#^[a-zA-Z]+://##' | cut -d/ -f1 | sed 's/^www\.//' | tr '[:upper:]' '[:lower:]')
+            case "$domain" in
+              youtube.com|youtu.be|music.youtube.com)
+                return 0 ;;
+              *)
+                return 1 ;;
+            esac
+          }
+
+          try_spotify_download() {
+            local target_url="$1"
+            local tmp_dir="$2"
+            local downloaded_file=""
+            local spotdl_log="$tmp_dir/spotdl.log"
+            local spotdl_pid=""
+            local spotdl_rc=1
+            local rate_limit_detected=0
+            local timed_out=0
+            local SPOTDL_TIMEOUT_SECONDS=300
+            local -a spotdl_args=(download "$target_url" --output "$tmp_dir/{artists} - {title}.{output-ext}" --max-retries 1 --threads 2 --use-cache-file)
+
+            if ! command -v spotdl >/dev/null 2>&1; then
+              return 1
+            fi
+
+            if [ -n "$SPOTIFY_CLIENT_ID" ] && [ -n "$SPOTIFY_CLIENT_SECRET" ]; then
+              spotdl_args+=(--client-id "$SPOTIFY_CLIENT_ID" --client-secret "$SPOTIFY_CLIENT_SECRET")
+            fi
+
+            : > "$spotdl_log"
+            spotdl "${spotdl_args[@]}" >"$spotdl_log" 2>&1 &
+            spotdl_pid=$!
+            while kill -0 "$spotdl_pid" 2>/dev/null; do
+              if grep -qiE 'rate/request limit|retry will occur after' "$spotdl_log" 2>/dev/null; then
+                rate_limit_detected=1
+                echo "Spotify API rate limit detected; aborting spotdl wait"
+                kill "$spotdl_pid" 2>/dev/null || true
+                break
+              fi
+              SPOTDL_TIMEOUT_SECONDS=$((SPOTDL_TIMEOUT_SECONDS - 1))
+              if [ "$SPOTDL_TIMEOUT_SECONDS" -le 0 ]; then
+                timed_out=1
+                echo "spotdl metadata stage timed out; aborting Spotify attempt"
+                kill "$spotdl_pid" 2>/dev/null || true
+                break
+              fi
+              sleep 1
+            done
+            wait "$spotdl_pid" 2>/dev/null || spotdl_rc=$?
+
+            if [ "$spotdl_rc" -eq 0 ]; then
+              downloaded_file=$(find "$tmp_dir" -maxdepth 3 -type f \( -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.flac' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \) -printf '%s\t%p\n' | sort -nr | head -n1 | cut -f2-)
+              if [ -n "$downloaded_file" ] && [ -f "$downloaded_file" ]; then
+                printf '%s\n' "$downloaded_file"
+                return 0
+              fi
+            fi
+            if [ "$rate_limit_detected" -eq 1 ] || grep -qiE 'rate/request limit|retry will occur after|429' "$spotdl_log" 2>/dev/null; then
+              echo "Spotify API rate limit hit for this runner/session"
+              if [ -z "$SPOTIFY_CLIENT_ID" ] || [ -z "$SPOTIFY_CLIENT_SECRET" ]; then
+                echo "Configure SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET secrets to avoid shared default app limits"
+              fi
+            fi
+            if [ "$timed_out" -eq 1 ]; then
+              echo "spotdl timed out before completion"
+            fi
+            echo "---- spotdl.log (truncated to 200 lines) ----"
+            tail -n 200 "$spotdl_log" 2>/dev/null || true
+
+            return 1
+          }
+
+          try_extractor_tools() {
+            local target_url="$1"
+            local tmp_dir="$2"
+            local id_tag="$3"
+            local extracted_file=""
+            local ytdlp_format
+            local postprocess_audio=0
+            local audio_codec=""
+            local merge_format=""
+            local relaxed_format="bestvideo*+bestaudio/best"
+            local youtube_clients="web,android"
+            local is_youtube=0
+            local -a youtube_client_candidates=()
+
+            case "$FORMAT_SELECTION" in
+              best)
+                ytdlp_format="$relaxed_format"
+                merge_format="mp4"
+                ;;
+              best-video)
+                ytdlp_format="bestvideo/best"
+                ;;
+              best-audio)
+                ytdlp_format="bestaudio/best"
+                ;;
+              360p|480p|720p|1080p)
+                FORMAT_HEIGHT="${FORMAT_SELECTION%p}"
+                ytdlp_format="bestvideo*[height<=${FORMAT_HEIGHT}]+bestaudio/best[height<=${FORMAT_HEIGHT}]/best"
+                merge_format="mp4"
+                ;;
+              mp4)
+                ytdlp_format="$relaxed_format"
+                merge_format="mp4"
+                ;;
+              webm)
+                ytdlp_format="bestvideo*[vcodec~='^(vp9|av01)']+bestaudio[acodec~='^(opus|vorbis)']/best"
+                merge_format="webm"
+                ;;
+              mp3)
+                ytdlp_format="bestaudio/best"
+                postprocess_audio=1
+                audio_codec="mp3"
+                ;;
+              m4a)
+                ytdlp_format="bestaudio[ext=m4a]/bestaudio"
+                postprocess_audio=1
+                audio_codec="m4a"
+                ;;
+              flac)
+                ytdlp_format="bestaudio/best"
+                postprocess_audio=1
+                audio_codec="flac"
+                ;;
+              *)
+                ytdlp_format="bestvideo*[height<=${VIDEO_QUALITY}]+bestaudio/best[height<=${VIDEO_QUALITY}]/best"
+                merge_format="mp4"
+                ;;
+            esac
+
+            if is_youtube_url "$target_url"; then
+              is_youtube=1
+              if [ "${#EXTRACTOR_COOKIE_ARGS[@]}" -gt 0 ]; then
+                youtube_clients="mweb"
+                youtube_client_candidates=("mweb" "default" "web_safari,web" "tv_downgraded,web_safari")
+              else
+                youtube_clients="mweb"
+                youtube_client_candidates=("mweb" "android_vr,web_safari" "default" "web,android,ios" "tv_simply")
+              fi
+            fi
+            if [ "${#youtube_client_candidates[@]}" -eq 0 ]; then
+              youtube_client_candidates=("$youtube_clients")
+            fi
+
+            run_ytdlp_attempt() {
+              local fmt="$1"
+              local clients="$2"
+              local use_cookies="$3"
+              local -a cookie_args=()
+              local -a args=(
+                --restrict-filenames
+                --no-playlist
+                --js-runtimes "$YTDLP_JS_RUNTIMES"
+                --remote-components ejs:npm
+                --retries 5
+                --fragment-retries 5
+                --file-access-retries 5
+              )
+
+              if [ -n "$fmt" ]; then
+                args+=(--format "$fmt")
+              fi
+              if [ -n "$merge_format" ]; then
+                args+=(--merge-output-format "$merge_format")
+              fi
+              if [ "$postprocess_audio" -eq 1 ]; then
+                args+=(--extract-audio --audio-format "$audio_codec")
+              fi
+              if [ "$is_youtube" -eq 1 ]; then
+                args+=(--extractor-args "youtube:player_client=${clients};formats=missing_pot;fetch_pot=always")
+                if [ "${#YTDLP_PROXY_ARGS[@]}" -gt 0 ]; then
+                  args+=("${YTDLP_PROXY_ARGS[@]}")
+                fi
+                if [ -n "$BGUTIL_SERVER_PID" ]; then
+                  args+=(--extractor-args "youtubepot-bgutilhttp:base_url=$BGUTIL_BASE_URL")
+                fi
+                if [ -n "$BGUTIL_SERVER_HOME" ] && [ -d "$BGUTIL_SERVER_HOME" ]; then
+                  args+=(--extractor-args "youtubepot-bgutilscript:server_home=$BGUTIL_SERVER_HOME")
+                fi
+                if [ -n "$YOUTUBE_PO_TOKEN" ]; then
+                  args+=(--extractor-args "youtube:po_token=mweb.gvs+$YOUTUBE_PO_TOKEN")
+                fi
+              fi
+              if [ "$use_cookies" = "1" ]; then
+                cookie_args=("${EXTRACTOR_COOKIE_ARGS[@]}")
+              fi
+
+              if "${YTDLP_CMD[@]}" \
+                "${args[@]}" \
+                "${cookie_args[@]}" \
+                -P "$tmp_dir" \
+                -o "${id_tag}.%(ext)s" \
+                "$target_url"; then
+                extracted_file=$(find "$tmp_dir" -maxdepth 2 -type f -name "${id_tag}.*" | head -n1)
+                if [ -n "$extracted_file" ] && [ -f "$extracted_file" ]; then
+                  printf '%s\n' "$extracted_file"
+                  return 0
+                fi
+              fi
+
+              return 1
+            }
+
+            local clients_candidate
+            for clients_candidate in "${youtube_client_candidates[@]}"; do
+              if run_ytdlp_attempt "$ytdlp_format" "$clients_candidate" 1; then
+                return 0
+              fi
+              if run_ytdlp_attempt "$relaxed_format" "$clients_candidate" 1; then
+                return 0
+              fi
+              if run_ytdlp_attempt "" "$clients_candidate" 1; then
+                return 0
+              fi
+            done
+
+            if [ "$is_youtube" -eq 1 ] && [ "${#EXTRACTOR_COOKIE_ARGS[@]}" -gt 0 ]; then
+              for clients_candidate in "mweb" "android_vr,web_safari" "tv_simply"; do
+                if run_ytdlp_attempt "$ytdlp_format" "$clients_candidate" 0; then
+                  return 0
+                fi
+                if run_ytdlp_attempt "$relaxed_format" "$clients_candidate" 0; then
+                  return 0
+                fi
+                if run_ytdlp_attempt "" "$clients_candidate" 0; then
+                  return 0
+                fi
+              done
+            fi
+
+            if [ "$is_youtube" -ne 1 ]; then
+              if youtube-dl "${EXTRACTOR_COOKIE_ARGS[@]}" -o "${tmp_dir}/${id_tag}.%(ext)s" "$target_url"; then
+                extracted_file=$(find "$tmp_dir" -maxdepth 2 -type f -name "${id_tag}.*" | head -n1)
+                if [ -n "$extracted_file" ] && [ -f "$extracted_file" ]; then
+                  printf '%s\n' "$extracted_file"
+                  return 0
+                fi
+              fi
+            fi
+
+            if [ "$is_youtube" -ne 1 ]; then
+              if gallery-dl "${EXTRACTOR_COOKIE_ARGS[@]}" -d "$tmp_dir" --no-part "$target_url"; then
+                extracted_file=$(find "$tmp_dir" -maxdepth 3 -type f ! -name '*.json' ! -name '*.txt' -printf '%s\t%p\n' | sort -nr | head -n1 | cut -f2-)
+                if [ -n "$extracted_file" ] && [ -f "$extracted_file" ]; then
+                  printf '%s\n' "$extracted_file"
+                  return 0
+                fi
+              fi
+            fi
+
+            return 1
+          }
+
+          expand_feed_url() {
+            local feed_url="$1"
+            python3 - "$feed_url" <<'PY'
+          import sys
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          url = sys.argv[1]
+          request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = response.read()
+
+          root = ET.fromstring(data)
+          ns = {
+              "atom": "http://www.w3.org/2005/Atom",
+              "media": "http://search.yahoo.com/mrss/",
+              "itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd",
+          }
+          seen = set()
+
+          def emit(value):
+              if value and value.startswith(("http://", "https://")) and value not in seen:
+                  seen.add(value)
+                  print(value)
+
+          for item in root.findall(".//item"):
+              for enclosure in item.findall("enclosure"):
+                  emit(enclosure.attrib.get("url"))
+              for media in item.findall("media:content", ns):
+                  emit(media.attrib.get("url"))
+              if not list(item.findall("enclosure")) and not list(item.findall("media:content", ns)):
+                  link = item.find("link")
+                  if link is not None:
+                      emit((link.text or "").strip())
+
+          for entry in root.findall(".//atom:entry", ns):
+              found_enclosure = False
+              for link in entry.findall("atom:link", ns):
+                  relation = link.attrib.get("rel", "alternate")
+                  if relation == "enclosure":
+                      found_enclosure = True
+                      emit(link.attrib.get("href"))
+              for media in entry.findall("media:content", ns):
+                  found_enclosure = True
+                  emit(media.attrib.get("url"))
+              if not found_enclosure:
+                  for link in entry.findall("atom:link", ns):
+                      if link.attrib.get("rel", "alternate") and link.attrib.get("href"):
+                          emit(link.attrib.get("href"))
+                          break
+          PY
+          }
+
+          is_feed_url() {
+            local target_url="$1"
+            local content_type="$2"
+            case "$target_url" in
+              *.rss|*.xml|*.atom|*/feed|*/rss|*/atom|*/feeds/*) return 0 ;;
+            esac
+            case "$content_type" in
+              application/rss+xml*|application/atom+xml*|application/xml*|text/xml*) return 0 ;;
+            esac
+            return 1
+          }
+
+          parse_urls() {
+            printf "%s\n" "$URLS" \
+              | tr ',' '\n' \
+              | tr ' ' '\n' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | sed '/^$/d'
+          }
+
+          select_primary_url() {
+            local raw_entry="$1"
+            local candidate=""
+            if [ "$ENABLE_MIRROR_FALLBACK" = "true" ]; then
+              IFS='|' read -r -a _cands <<< "$raw_entry"
+              for candidate in "${_cands[@]}"; do
+                candidate=$(printf "%s" "$candidate" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -n "$candidate" ] || continue
+                is_http_url "$candidate" || continue
+                printf "%s\n" "$candidate"
+                return 0
+              done
+              return 1
+            fi
+            candidate=$(printf "%s" "$raw_entry" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if is_http_url "$candidate"; then
+              printf "%s\n" "$candidate"
+              return 0
+            fi
+            return 1
+          }
+
+          FEED_URLS=0
+          mapfile -t RAW_URL_LIST < <(parse_urls)
+          URL_LIST=()
+          for RAW_URL in "${RAW_URL_LIST[@]}"; do
+            FEED_HEADERS="$HEAD_CACHE_DIR/feed-$(url_key "$RAW_URL").headers"
+            curl -sSIL --connect-timeout 10 --max-time 30 "$RAW_URL" -o "$FEED_HEADERS" || true
+            FEED_CONTENT_TYPE=$(read_header_value "Content-Type" "$FEED_HEADERS" | tr -d "[:space:]" | tr "[:upper:]" "[:lower:]" || true)
+            if is_feed_url "$RAW_URL" "$FEED_CONTENT_TYPE"; then
+              FEED_URLS=$((FEED_URLS + 1))
+              echo "RSS/Atom feed detected: $RAW_URL"
+              mapfile -t FEED_ENTRIES < <(expand_feed_url "$RAW_URL" 2>/dev/null || true)
+              if [ "${#FEED_ENTRIES[@]}" -eq 0 ]; then
+                echo "Feed produced no downloadable entries: $RAW_URL"
+              else
+                URL_LIST+=("${FEED_ENTRIES[@]}")
+                echo "Expanded ${#FEED_ENTRIES[@]} feed entries: $RAW_URL"
+              fi
+            else
+              URL_LIST+=("$RAW_URL")
+            fi
+          done
+
+          mapfile -t URL_LIST < <(printf "%s\n" "${URL_LIST[@]}" | sed '/^$/d' | awk '!seen[$0]++')
+          mapfile -t UNIQUE_SITES < <(
+            for u in "${URL_LIST[@]}"; do
+              p="$(select_primary_url "$u" || true)"
+              [ -n "$p" ] || continue
+              normalize_domain "$p"
+            done | sed '/^$/d' | sort -u
+          )
+
+          declare -A SITE_DIRS
+
+          for site in "${UNIQUE_SITES[@]}"; do
+            SITE_DIR=$(next_site_folder "$USER_ROOT" "$site")
+            mkdir -p "$SITE_DIR"
+            SITE_DIRS["$site"]="$SITE_DIR"
+            echo "Site folder: $SITE_DIR"
+          done
+
+          pids=()
+          URL_FAILS=0
+
+          wait_and_count() {
+            local pid="$1"
+            if ! wait "$pid"; then
+              URL_FAILS=$((URL_FAILS + 1))
+              echo "A download worker failed (failures: $URL_FAILS)"
+              if [ "$FAIL_FAST_AFTER" -gt 0 ] && [ "$URL_FAILS" -ge "$FAIL_FAST_AFTER" ]; then
+                echo "Fail-fast threshold reached"
+                exit 1
+              fi
+            fi
+          }
+
+          for URL in "${URL_LIST[@]}"; do
+            PRIMARY_URL="$(select_primary_url "$URL" || true)"
+            if [ -z "$PRIMARY_URL" ]; then
+              echo "Skipping URL entry with no valid http/https target: $URL"
+              continue
+            fi
+            FILENAME=$(basename "$PRIMARY_URL")
+            [ -n "$FILENAME" ] || FILENAME="download.bin"
+            SITE=$(normalize_domain "$PRIMARY_URL")
+            SITE_DIR="${SITE_DIRS[$SITE]}"
+            TMP_DIR="$SITE_DIR/.tmp_parts"
+            URL_HASH="$(url_key "$PRIMARY_URL")"
+            HEADERS_FILE="$HEAD_CACHE_DIR/${URL_HASH}.headers"
+            mkdir -p "$TMP_DIR"
+
+            if [ "$SKIP_EXISTING_BY_FILENAME" = "true" ] && [ -f "$SITE_DIR/$FILENAME" ]; then
+              echo "Existing filename, skipping: $SITE_DIR/$FILENAME"
+              continue
+            fi
+
+            curl -sSIL --connect-timeout 10 --max-time 30 "$PRIMARY_URL" -o "$HEADERS_FILE" || true
+            NEW_CONTENT_LENGTH=$(read_header_value "Content-Length" "$HEADERS_FILE")
+            NEW_CONTENT_TYPE=$(read_header_value "Content-Type" "$HEADERS_FILE" | tr -d "[:space:]" | tr "[:upper:]" "[:lower:]" || true)
+
+            IS_DIRECT_FILE=0
+            if is_likely_file "$PRIMARY_URL" "$NEW_CONTENT_TYPE"; then
+              IS_DIRECT_FILE=1
+            fi
+            IS_SPOTIFY_URL=0
+            if is_spotify_url "$PRIMARY_URL"; then
+              IS_SPOTIFY_URL=1
+            fi
+            IS_YOUTUBE_URL=0
+            if is_youtube_url "$PRIMARY_URL"; then
+              IS_YOUTUBE_URL=1
+            fi
+            SHOULD_USE_EXTRACTOR=0
+            if [ "$IS_DIRECT_FILE" -ne 1 ] && is_extractor_domain "$PRIMARY_URL"; then
+              SHOULD_USE_EXTRACTOR=1
+            fi
+            if [ "$IS_SPOTIFY_URL" -eq 1 ]; then
+              SHOULD_USE_EXTRACTOR=0
+            fi
+
+            FINAL_FILENAME=$(resolve_output_name "$SITE_DIR" "$FILENAME")
+
+            DL_CONNECTIONS="$MAX_CONNECTIONS_PER_FILE"
+            if [ "$LARGE_FILE_THRESHOLD_MB" -gt 0 ] && [ -n "$NEW_CONTENT_LENGTH" ] && [ "$NEW_CONTENT_LENGTH" -gt "$LARGE_FILE_THRESHOLD_BYTES" ]; then
+              DL_CONNECTIONS="$LARGE_FILE_CONNECTIONS"
+            fi
+            if [ "$ADAPTIVE_CONNECTIONS" = "true" ] && [ "$URL_FAILS" -gt 0 ]; then
+              DL_CONNECTIONS=$((MAX_CONNECTIONS_PER_FILE - URL_FAILS))
+              if [ "$DL_CONNECTIONS" -lt 1 ]; then DL_CONNECTIONS=1; fi
+            fi
+
+            (
+              DOWNLOAD_OK=0
+              ACTUAL_FILE=""
+
+              if [ "$DOWNLOAD_OK" -ne 1 ] && [ "$IS_SPOTIFY_URL" -eq 1 ]; then
+                echo "Spotify URL detected, trying spotdl first: $PRIMARY_URL"
+                SPOTIFY_FILE=""
+                if SPOTIFY_FILE=$(try_spotify_download "$PRIMARY_URL" "$TMP_DIR"); then
+                  ACTUAL_FILE="$SPOTIFY_FILE"
+                  DOWNLOAD_OK=1
+                  FINAL_FILENAME=$(basename "$ACTUAL_FILE")
+                fi
+              fi
+
+              if [ "$DOWNLOAD_OK" -ne 1 ] && is_fileditchfiles_url "$PRIMARY_URL"; then
+                echo "fileditchfiles URL detected, extracting real URL: $PRIMARY_URL"
+                FILEDITCHFILES_FILE=""
+                if FILEDITCHFILES_FILE=$(try_fileditchfiles_download "$PRIMARY_URL" "$TMP_DIR" "${URL_HASH:0:12}"); then
+                  ACTUAL_FILE="$FILEDITCHFILES_FILE"
+                  DOWNLOAD_OK=1
+                  FINAL_FILENAME=$(basename "$ACTUAL_FILE")
+                fi
+              fi
+
+              if [ "$DOWNLOAD_OK" -ne 1 ] && [ "$SHOULD_USE_EXTRACTOR" -eq 1 ]; then
+                echo "Extractor domain detected, trying extractor tools: $PRIMARY_URL"
+                YTDLP_ID="ytdlp_${URL_HASH:0:12}"
+                EXTRACTED_FILE=""
+                if EXTRACTED_FILE=$(try_extractor_tools "$PRIMARY_URL" "$TMP_DIR" "$YTDLP_ID"); then
+                  ACTUAL_FILE="$EXTRACTED_FILE"
+                  DOWNLOAD_OK=1
+                  FINAL_FILENAME=$(basename "$ACTUAL_FILE")
+                fi
+              fi
+
+              if [ "$DOWNLOAD_OK" -ne 1 ] && [ "$IS_SPOTIFY_URL" -ne 1 ] && [ "$IS_YOUTUBE_URL" -ne 1 ] && [ "$SHOULD_USE_EXTRACTOR" -ne 1 ]; then
+                if [ "$ENABLE_MIRROR_FALLBACK" = "true" ]; then
+                  IFS='|' read -r -a MIRROR_URLS <<< "$URL"
+                else
+                  MIRROR_URLS=("$PRIMARY_URL")
+                fi
+                for CANDIDATE_URL in "${MIRROR_URLS[@]}"; do
+                  CANDIDATE_URL=$(printf "%s" "$CANDIDATE_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                  [ -n "$CANDIDATE_URL" ] || continue
+                  if ! is_http_url "$CANDIDATE_URL"; then
+                    echo "Skipping invalid mirror URL token: $CANDIDATE_URL"
+                    continue
+                  fi
+                  echo "Downloading $CANDIDATE_URL -> $FINAL_FILENAME"
+                  if aria2c \
+                    --continue=true \
+                    --retry-wait=2 \
+                    --max-tries=5 \
+                    --split="$DL_CONNECTIONS" \
+                    --max-connection-per-server="$DL_CONNECTIONS" \
+                    --min-split-size=5M \
+                    --file-allocation=none \
+                    --async-dns=true \
+                    --summary-interval=0 \
+                    --console-log-level=warn \
+                    --timeout="$REQUEST_TIMEOUT_SECONDS" \
+                    --dir="$TMP_DIR" \
+                    --out="$FINAL_FILENAME" \
+                    "$CANDIDATE_URL"; then
+                    DOWNLOAD_OK=1
+                    break
+                  fi
+                done
+                ACTUAL_FILE="$TMP_DIR/$FINAL_FILENAME"
+              fi
+
+              if [ "$DOWNLOAD_OK" -eq 1 ]; then
+                if is_html_file "$ACTUAL_FILE"; then
+                  echo "Downloaded HTML page instead of file for $PRIMARY_URL"
+                  rm -f "$ACTUAL_FILE"
+                  DOWNLOAD_OK=0
+                  if is_fileditchfiles_url "$PRIMARY_URL"; then
+                    echo "Retrying fileditchfiles extraction due to HTML response: $PRIMARY_URL"
+                    FILEDITCHFILES_FILE=""
+                    if FILEDITCHFILES_FILE=$(try_fileditchfiles_download "$PRIMARY_URL" "$TMP_DIR" "${URL_HASH:0:12}"); then
+                      ACTUAL_FILE="$FILEDITCHFILES_FILE"
+                      DOWNLOAD_OK=1
+                      FINAL_FILENAME=$(basename "$ACTUAL_FILE")
+                    fi
+                  fi
+                  if [ "$DOWNLOAD_OK" -ne 1 ] && [ "$IS_DIRECT_FILE" -ne 1 ] && [ "$SHOULD_USE_EXTRACTOR" -ne 1 ]; then
+                    echo "Retrying via extractor tools due to HTML response: $PRIMARY_URL"
+                    YTDLP_ID="ytdlp_${URL_HASH:0:12}"
+                    EXTRACTED_FILE=""
+                    if EXTRACTED_FILE=$(try_extractor_tools "$PRIMARY_URL" "$TMP_DIR" "$YTDLP_ID"); then
+                      ACTUAL_FILE="$EXTRACTED_FILE"
+                      DOWNLOAD_OK=1
+                      FINAL_FILENAME=$(basename "$ACTUAL_FILE")
+                    fi
+                  fi
+                fi
+              fi
+
+              if [ "$DOWNLOAD_OK" -eq 1 ] && is_html_file "$ACTUAL_FILE"; then
+                echo "Final output is still HTML for $PRIMARY_URL; failing this URL"
+                rm -f "$ACTUAL_FILE"
+                exit 1
+              fi
+
+              if [ "$DOWNLOAD_OK" -eq 1 ]; then
+                FILE_SIZE=$(stat -c%s "$ACTUAL_FILE" 2>/dev/null || echo 0)
+                printf '{"ts":"%s","url":"%s","site":"%s","status":"downloaded","filename":"%s","bytes":%s,"connections":%s}\n' \
+                  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PRIMARY_URL" "$SITE" "$FINAL_FILENAME" "$FILE_SIZE" "$DL_CONNECTIONS" >> "$MANIFEST_FILE"
+              else
+                exit 1
+              fi
+            ) &
+            pids+=($!)
+
+            if [ "${#pids[@]}" -ge "$MAX_PARALLEL_DOWNLOADS" ]; then
+              wait_and_count "${pids[0]}"
+              pids=("${pids[@]:1}")
+            fi
+          done
+
+          for pid in "${pids[@]}"; do
+            wait_and_count "$pid"
+          done
+
+          TOTAL_ENTRIES=$(wc -l < "$MANIFEST_FILE" 2>/dev/null || echo 0)
+          DOWNLOADED_COUNT=$(grep -c '"status":"downloaded"' "$MANIFEST_FILE" 2>/dev/null || echo 0)
+
+          if [ "$URL_FAILS" -gt 0 ] || [ "$DOWNLOADED_COUNT" -eq 0 ]; then
+            echo "Download stage failed: downloaded=$DOWNLOADED_COUNT failed_workers=$URL_FAILS"
+            exit 1
+          fi
+
+          HASH_INDEX="$RUN_DIR/hash-index.tsv"
+          HASHES_FILE="$RUN_DIR/hashes.tsv"
+          : > "$HASH_INDEX"
+          : > "$HASHES_FILE"
+
+          mapfile -t NEW_FILES < <(git ls-files --others --modified --exclude-standard downloads/)
+          while IFS= read -r FILE; do
+            [ -f "$FILE" ] || continue
+            case "$FILE" in
+              "$USER_ROOT"/*) continue ;;
+            esac
+            HASH=$(sha256sum "$FILE" | awk '{print $1}')
+            printf '%s\t%s\n' "$HASH" "$FILE" >> "$HASH_INDEX"
+          done < <(git ls-files downloads/)
+
+          for FILE in "${NEW_FILES[@]}"; do
+            [ -f "$FILE" ] || continue
+            case "$FILE" in
+              "$USER_ROOT"/*) ;;
+              *) continue ;;
+            esac
+            HASH=$(sha256sum "$FILE" | awk '{print $1}')
+            EXISTING=$(awk -F '\t' -v hash="$HASH" -v file="$FILE" '$1 == hash && $2 != file { print $2; exit }' "$HASH_INDEX")
+            if [ -n "$EXISTING" ] && [ -f "$EXISTING" ]; then
+              echo "Duplicate content, removing: $FILE (matches $EXISTING)"
+              rm -f "$FILE"
+              continue
+            fi
+            printf '%s\t%s\n' "$HASH" "$FILE" >> "$HASH_INDEX"
+          done
+
+          if [ "$MODE" = "zip" ]; then
+            ARCHIVE_NAME="$USER_ROOT/archive_$(date +%Y%m%d_%H%M%S).zip"
+            echo "Creating zip archive: $ARCHIVE_NAME"
+            ZIP_CREATE_CMD=(zip -j "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$ARCHIVE_NAME")
+            find "$USER_ROOT" -type f -path "*/.tmp_parts/*" -print0 | xargs -0 -r "${ZIP_CREATE_CMD[@]}"
+            find "$USER_ROOT" -type d -name ".tmp_parts" -exec rm -rf {} +
+          else
+            find "$USER_ROOT" -type f -path "*/.tmp_parts/*" | while IFS= read -r FILE; do
+              [ -f "$FILE" ] || continue
+              SIZE=$(stat -c%s "$FILE")
+              BASENAME=$(basename "$FILE")
+              SITE_DIR=$(dirname "$(dirname "$FILE")")
+
+              if [ "$SPLIT_THRESHOLD_BYTES" -gt 0 ] && [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+                echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting into ${SPLIT_THRESHOLD_MB}MB parts (zip-split)"
+                zip -0 "${ZIP_SECURITY_ARGS[@]}" -s "${SPLIT_THRESHOLD_MB}m" "$SITE_DIR/${BASENAME}.zip" -j "$FILE"
+              else
+                mv "$FILE" "$SITE_DIR/$BASENAME"
+              fi
+            done
+            find "$USER_ROOT" -type d -name ".tmp_parts" -exec rm -rf {} +
+          fi
+
+          ZIP_GROUP_THRESHOLD=${ZIP_GROUP_THRESHOLD:-15}
+          if [ "$PACKAGE_OUTPUT" = "site-zip" ]; then
+            for site in "${UNIQUE_SITES[@]}"; do
+              SITE_DIR="${SITE_DIRS[$site]}"
+              [ -d "$SITE_DIR" ] || continue
+              SITE_BASENAME=$(basename "$SITE_DIR")
+              ZIP_PATH="${SITE_DIR}.zip"
+              echo "Packing site folder: $SITE_BASENAME -> $(basename "$ZIP_PATH")"
+              (
+                cd "$USER_ROOT"
+
+                SITE_FILE_COUNT=$(find "$SITE_BASENAME" -type f 2>/dev/null | wc -l || true)
+                if [ "$SITE_FILE_COUNT" -le 1 ]; then
+                  echo "Skipping site zip for $SITE_BASENAME (only $SITE_FILE_COUNT file)"
+                  exit 0
+                fi
+
+                MEDIA_EXT_PATTERNS=("*.mp4" "*.mkv" "*.mp3" "*.flac" "*.wav" "*.webm" "*.avi" "*.mov" "*.m4a" "*.aac")
+                TEXT_EXT_PATTERNS=("*.txt" "*.md" "*.csv" "*.log")
+
+                TXT_COUNT=$(find "$SITE_BASENAME" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) 2>/dev/null | wc -l || true)
+                MEDIA_COUNT=$(find "$SITE_BASENAME" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) 2>/dev/null | wc -l || true)
+
+                EXCLUDE_ARGS=()
+                for pat in "${MEDIA_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
+                if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
+                  for pat in "${TEXT_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
+                fi
+
+                if [ "${#EXCLUDE_ARGS[@]}" -gt 0 ]; then
+                  zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$SITE_BASENAME.zip" "$SITE_BASENAME" "${EXCLUDE_ARGS[@]}"
+                else
+                  zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$SITE_BASENAME.zip" "$SITE_BASENAME"
+                fi
+
+                if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
+                  echo "Creating text zip for $SITE_BASENAME (count=$TXT_COUNT)"
+                  find "$SITE_BASENAME" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) -print | zip -@ -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${SITE_BASENAME}_text.zip"
+                fi
+
+                if [ "$MEDIA_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
+                  echo "Creating media zip for $SITE_BASENAME (count=$MEDIA_COUNT); storing files uncompressed inside zip"
+                  find "$SITE_BASENAME" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) -print | zip -@ -0 -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${SITE_BASENAME}_media.zip"
+                fi
+              )
+            done
+          elif [ "$PACKAGE_OUTPUT" = "user-zip" ]; then
+            USER_ARCHIVE="downloads/${ACTOR_SAFE}_downloads_$(date +%Y%m%d_%H%M%S).zip"
+            echo "Packing user folder: $(basename "$USER_ROOT") -> $(basename "$USER_ARCHIVE")"
+            (
+              cd downloads
+
+              USER_FILE_COUNT=$(find "$(basename "$USER_ROOT")" -type f 2>/dev/null | wc -l || true)
+              if [ "$USER_FILE_COUNT" -le 1 ]; then
+                echo "Skipping user zip (only $USER_FILE_COUNT file)"
+                exit 0
+              fi
+
+              MEDIA_EXT_PATTERNS=("*.mp4" "*.mkv" "*.mp3" "*.flac" "*.wav" "*.webm" "*.avi" "*.mov" "*.m4a" "*.aac")
+              TEXT_EXT_PATTERNS=("*.txt" "*.md" "*.csv" "*.log")
+
+              TXT_COUNT=$(find "$(basename "$USER_ROOT")" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) 2>/dev/null | wc -l || true)
+              MEDIA_COUNT=$(find "$(basename "$USER_ROOT")" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) 2>/dev/null | wc -l || true)
+
+              EXCLUDE_ARGS=()
+              for pat in "${MEDIA_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
+              if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
+                for pat in "${TEXT_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
+              fi
+
+              if [ "${#EXCLUDE_ARGS[@]}" -gt 0 ]; then
+                zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$(basename "$USER_ARCHIVE")" "$(basename "$USER_ROOT")" "${EXCLUDE_ARGS[@]}"
+              else
+                zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$(basename "$USER_ARCHIVE")" "$(basename "$USER_ROOT")"
+              fi
+
+              if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
+                echo "Creating text zip for user (count=$TXT_COUNT)"
+                find "$(basename "$USER_ROOT")" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) -print | zip -@ -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${ACTOR_SAFE}_text.zip"
+              fi
+
+              if [ "$MEDIA_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
+                echo "Creating media zip for user (count=$MEDIA_COUNT); storing files uncompressed inside zip"
+                find "$(basename "$USER_ROOT")" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) -print | zip -@ -0 -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${ACTOR_SAFE}_media.zip"
+              fi
+            )
+          fi
+
+          while IFS= read -r OVERSIZED; do
+            [ -f "$OVERSIZED" ] || continue
+            case "$OVERSIZED" in
+              *.z[0-9][0-9]|*.z[0-9][0-9][0-9]) continue ;;
+            esac
+            SIZE_MB=$(( $(stat -c%s "$OVERSIZED") / 1024 / 1024 ))
+            DIRNAME=$(dirname "$OVERSIZED")
+            BASENAME=$(basename "$OVERSIZED")
+            echo "Oversized file detected (${SIZE_MB}MB): $OVERSIZED"
+            if [[ "$BASENAME" == *.zip ]]; then
+              STEM="${BASENAME%.zip}"
+              OUT_ZIP="$DIRNAME/${STEM}.split.zip"
+              zip -q "$OVERSIZED" --out "$OUT_ZIP" "${ZIP_SPLIT_ARGS[@]}"
+              rm -f "$OVERSIZED"
+            else
+              zip -0 -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$OVERSIZED.zip" -j "$OVERSIZED"
+              rm -f "$OVERSIZED"
+            fi
+          done < <(find "$USER_ROOT" -type f -size +${GITHUB_MAX_FILE_MB}M)
+
+          if [ "$CLEANUP_MODE" = "archives-only" ]; then
+            echo "Cleanup: keeping only archive files"
+            find "$USER_ROOT" -type f | while IFS= read -r F; do
+              case "$F" in
+                *.zip|*.z[0-9][0-9]|*.z[0-9][0-9][0-9]) ;;
+                *) rm -f "$F" ;;
+              esac
+            done
+            find "$USER_ROOT" -type d -empty -delete
+          fi
+
+          for FILE in "${NEW_FILES[@]}"; do
+            [ -f "$FILE" ] || continue
+            if ! git ls-files --others --modified --exclude-standard -- "$FILE" | grep -q .; then
+              continue
+            fi
+            HASH=$(sha256sum "$FILE" | awk '{print $1}')
+            SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+            RELATIVE="${FILE#./}"
+            printf '%s\t%s\t%s\n' "$HASH" "$SIZE" "$RELATIVE" >> "$HASHES_FILE"
+          done
+
+          {
+            echo '## Download summary'
+            echo
+            echo "- Feed URLs expanded: $FEED_URLS"
+            echo "- Downloaded: $DOWNLOADED_COUNT"
+            echo "- Failed: $URL_FAILS"
+            echo "- Files in repository tree: $(wc -l < "$HASHES_FILE")"
+            echo
+            echo '| SHA-256 | Size (bytes) | File |'
+            echo '| --- | ---: | --- |'
+            while IFS=$'\t' read -r HASH SIZE FILE; do
+              printf '| `%s` | %s | `%s` |\n' "$HASH" "$SIZE" "$FILE"
+            done < "$HASHES_FILE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Run finished: downloaded=$DOWNLOADED_COUNT entries=$TOTAL_ENTRIES failed_workers=$URL_FAILS"
+
+      - name: Commit & Push in batches
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          COMMITTER="${GITHUB_REPOSITORY_OWNER:?GITHUB_REPOSITORY_OWNER is not set}"
+          git config user.name "$COMMITTER"
+          git config user.email "${COMMITTER}@users.noreply.github.com"
+
+          echo "Preparing to commit files"
+
+          if find downloads -type f -size +99M | grep -q .; then
+            echo "Found files larger than GitHub's 100MB hard limit. Refusing to push:"
+            find downloads -type f -size +99M -printf '%p (%s bytes)\n'
+            exit 1
+          fi
+
+          mapfile -t ALL_FILES < <(git ls-files --others --modified --exclude-standard downloads/)
+
+          TOTAL=${#ALL_FILES[@]}
+          echo "Total files to push: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          BATCH_SIZE=20
+          BATCH_NUM=0
+
+          if ! git pull --rebase --autostash origin "$BRANCH"; then
+            echo "Rebase against origin/$BRANCH failed - aborting so we don't commit on top of a broken rebase"
+            exit 1
+          fi
+
+          for (( i=0; i<TOTAL; i+=BATCH_SIZE )); do
+            BATCH_NUM=$(( BATCH_NUM + 1 ))
+            BATCH=("${ALL_FILES[@]:i:BATCH_SIZE}")
+
+            echo "Pushing batch $BATCH_NUM: files $((i+1))–$(( i + ${#BATCH[@]} )) of $TOTAL"
+
+            git add "${BATCH[@]}"
+            git -c user.name="$COMMITTER" -c user.email="${COMMITTER}@users.noreply.github.com" commit -m "Add downloaded files - batch $BATCH_NUM [skip ci]"
+            echo "Batch $BATCH_NUM committed locally"
+          done
+
+          git push origin HEAD:"$BRANCH"
+
+          echo "All $TOTAL files pushed in $BATCH_NUM batch(es)"
