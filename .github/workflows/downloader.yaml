@@ -1,10 +1,10 @@
-name: Download From URL
+name: Download From URL(s)
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Space-separated list of URLs to download'
+        description: 'Space-separated list of URL(s) to download'
         required: true
         type: string
       mode:
@@ -15,27 +15,6 @@ on:
         options:
           - normal
           - zip
-      split_threshold_mb:
-        description: 'Split files larger than this MB (0 = never split)'
-        required: false
-        default: 90
-        type: number
-      max_parallel_downloads:
-        description: 'How many files to download in parallel'
-        required: false
-        default: 3
-        type: number
-      video_quality:
-        description: 'Video quality fallback for extractor downloads'
-        required: false
-        default: '720'
-        type: choice
-        options:
-          - '360'
-          - '480'
-          - '720'
-          - '1080'
-          - best
       format_selection:
         description: 'Extractor output format'
         required: false
@@ -54,33 +33,6 @@ on:
           - mp3
           - m4a
           - flac
-      package_output:
-        description: 'Create easy-download archives after download'
-        required: false
-        default: 'site-zip'
-        type: choice
-        options:
-          - none
-          - site-zip
-          - user-zip
-      request_timeout_seconds:
-        description: 'Max seconds per file download attempt'
-        required: false
-        default: 1800
-        type: number
-      fail_fast_after:
-        description: 'Stop run after this many failed URLs (0 disables)'
-        required: false
-        default: 5
-        type: number
-      cleanup_mode:
-        description: 'After packaging, optionally keep only archives'
-        required: false
-        default: 'keep-all'
-        type: choice
-        options:
-          - keep-all
-          - archives-only
       skip_existing_by_filename:
         description: 'Skip when same filename already exists in target site folder'
         required: false
@@ -108,6 +60,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
       - name: Setup Node
@@ -139,44 +92,30 @@ jobs:
         env:
           INPUT_MODE: ${{ github.event.inputs.mode }}
           INPUT_URLS: ${{ github.event.inputs.urls }}
-          INPUT_SPLIT_THRESHOLD_MB: ${{ github.event.inputs.split_threshold_mb }}
-          INPUT_MAX_PARALLEL_DOWNLOADS: ${{ github.event.inputs.max_parallel_downloads }}
-          INPUT_VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
           INPUT_FORMAT_SELECTION: ${{ github.event.inputs.format_selection }}
-          INPUT_PACKAGE_OUTPUT: ${{ github.event.inputs.package_output }}
-          INPUT_REQUEST_TIMEOUT_SECONDS: ${{ github.event.inputs.request_timeout_seconds }}
-          INPUT_FAIL_FAST_AFTER: ${{ github.event.inputs.fail_fast_after }}
-          INPUT_CLEANUP_MODE: ${{ github.event.inputs.cleanup_mode }}
           INPUT_SKIP_EXISTING_BY_FILENAME: ${{ github.event.inputs.skip_existing_by_filename }}
           INPUT_ENABLE_WARP_PROXY: ${{ github.event.inputs.enable_warp_proxy }}
           INPUT_ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
           INPUT_YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          INPUT_YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          INPUT_YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          INPUT_YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+          INPUT_COOKIES: ${{ secrets.COOKIES }}
+          INPUT_COOKIES_B64: ${{ secrets.COOKIES_B64 }}
           INPUT_YOUTUBE_PO_TOKEN: ${{ secrets.YOUTUBE_PO_TOKEN }}
           INPUT_BGUTIL_SERVER_HOME: ${{ env.BGUTIL_SERVER_HOME }}
           INPUT_SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           INPUT_SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          INPUT_SPOTDL_CLIENT_ID: ${{ secrets.SPOTDL_CLIENT_ID }}
+          INPUT_SPOTDL_CLIENT_SECRET: ${{ secrets.SPOTDL_CLIENT_SECRET }}
         run: |
           MODE="${INPUT_MODE}"
           URLS="${INPUT_URLS}"
-          SPLIT_THRESHOLD_MB="${INPUT_SPLIT_THRESHOLD_MB}"
-          MAX_PARALLEL_DOWNLOADS="${INPUT_MAX_PARALLEL_DOWNLOADS}"
+          SPLIT_THRESHOLD_MB=90
+          MAX_PARALLEL_DOWNLOADS=3
           MAX_CONNECTIONS_PER_FILE=8
-          VIDEO_QUALITY="${INPUT_VIDEO_QUALITY:-720}"
           FORMAT_SELECTION="${INPUT_FORMAT_SELECTION:-720p}"
-          PACKAGE_OUTPUT="${INPUT_PACKAGE_OUTPUT}"
-          REQUEST_TIMEOUT_SECONDS="${INPUT_REQUEST_TIMEOUT_SECONDS}"
-          if ! printf '%s\n' "${REQUEST_TIMEOUT_SECONDS:-}" | grep -Eq '^[0-9]+$'; then
-            REQUEST_TIMEOUT_SECONDS=60
-          fi
-          if [ "$REQUEST_TIMEOUT_SECONDS" -lt 1 ]; then
-            REQUEST_TIMEOUT_SECONDS=1
-          fi
-          if [ "$REQUEST_TIMEOUT_SECONDS" -gt 600 ]; then
-            echo "Requested timeout ${REQUEST_TIMEOUT_SECONDS} exceeds aria2 maximum (600). Capping to 600."
-            REQUEST_TIMEOUT_SECONDS=600
-          fi
-          FAIL_FAST_AFTER="${INPUT_FAIL_FAST_AFTER}"
-          CLEANUP_MODE="${INPUT_CLEANUP_MODE}"
+          REQUEST_TIMEOUT_SECONDS=60
           SKIP_EXISTING_BY_FILENAME="${INPUT_SKIP_EXISTING_BY_FILENAME}"
           ENABLE_WARP_PROXY="${INPUT_ENABLE_WARP_PROXY:-true}"
           ZIP_PASSWORD="${INPUT_ZIP_PASSWORD:-}"
@@ -206,13 +145,23 @@ jobs:
           YTDLP_CMD=(python3 -m yt_dlp)
           YOUTUBE_PO_TOKEN="${INPUT_YOUTUBE_PO_TOKEN:-}"
           BGUTIL_SERVER_HOME="${INPUT_BGUTIL_SERVER_HOME:-}"
-          SPOTIFY_CLIENT_ID="${INPUT_SPOTIFY_CLIENT_ID:-}"
-          SPOTIFY_CLIENT_SECRET="${INPUT_SPOTIFY_CLIENT_SECRET:-}"
+          SPOTIFY_CLIENT_ID="${INPUT_SPOTIFY_CLIENT_ID:-${INPUT_SPOTDL_CLIENT_ID:-}}"
+          SPOTIFY_CLIENT_SECRET="${INPUT_SPOTIFY_CLIENT_SECRET:-${INPUT_SPOTDL_CLIENT_SECRET:-}}"
           BGUTIL_BASE_URL="http://127.0.0.1:4416"
           BGUTIL_SERVER_PID=""
           WARP_CONTAINER_NAME=""
           WARP_STARTED=0
           YTDLP_PROXY_ARGS=()
+
+          echo "Downloading with mode: $MODE"
+          echo "Extractor format: $FORMAT_SELECTION"
+          echo "Skip existing filename: $SKIP_EXISTING_BY_FILENAME"
+          echo "Enable WARP proxy: $ENABLE_WARP_PROXY"
+          if [ -n "$ZIP_PASSWORD" ]; then
+            echo "Zip password: enabled"
+          else
+            echo "Zip password: disabled"
+          fi
 
           mkdir -p "$USER_ROOT" "$RUN_DIR" "$HEAD_CACHE_DIR"
           : > "$MANIFEST_FILE"
@@ -228,9 +177,16 @@ jobs:
           }
           trap cleanup EXIT
 
-          RAW_COOKIES_TEXT="${INPUT_YOUTUBE_COOKIES:-}"
-          if [ -n "$RAW_COOKIES_TEXT" ]; then
-            printf '%s\n' "$RAW_COOKIES_TEXT" > "$COOKIE_FILE"
+          RAW_COOKIES_B64="${INPUT_YOUTUBE_COOKIES_B64:-${INPUT_YT_COOKIES_B64:-${INPUT_COOKIES_B64:-}}}"
+          RAW_COOKIES_TEXT="${INPUT_YOUTUBE_COOKIES:-${INPUT_YT_COOKIES:-${INPUT_COOKIES:-}}}"
+          if [ -n "$RAW_COOKIES_B64" ]; then
+            printf '%s' "$RAW_COOKIES_B64" | base64 -d > "$COOKIE_FILE" || true
+          elif [ -n "$RAW_COOKIES_TEXT" ]; then
+            if printf '%s' "$RAW_COOKIES_TEXT" | grep -q '\\n'; then
+              printf '%b' "$RAW_COOKIES_TEXT" > "$COOKIE_FILE"
+            else
+              printf '%s\n' "$RAW_COOKIES_TEXT" > "$COOKIE_FILE"
+            fi
           fi
 
           if [ -s "$COOKIE_FILE" ]; then
@@ -240,6 +196,7 @@ jobs:
             fi
             chmod 600 "$COOKIE_FILE"
             EXTRACTOR_COOKIE_ARGS=(--cookies "$COOKIE_FILE")
+            echo "Using cookies secret for extractor tools"
             if ! awk -F '\t' 'BEGIN{ok=0} /^[^#]/ {if (NF>=7) ok=1} END{exit ok?0:1}' "$COOKIE_FILE"; then
               echo "YOUTUBE_COOKIES does not look like Netscape cookies.txt format"
             fi
@@ -257,19 +214,25 @@ jobs:
           elif command -v nodejs >/dev/null 2>&1; then
             YTDLP_JS_RUNTIMES="node:$(command -v nodejs)"
           fi
+          echo "Using yt-dlp JS runtimes: $YTDLP_JS_RUNTIMES"
+          "${YTDLP_CMD[@]}" --version || true
           if [ -n "$BGUTIL_SERVER_HOME" ] && [ -d "$BGUTIL_SERVER_HOME" ]; then
+            echo "Using bgutil server_home: $BGUTIL_SERVER_HOME"
             if [ -f "$BGUTIL_SERVER_HOME/build/main.js" ]; then
               BGUTIL_SERVER_LOG="$RUN_DIR/bgutil-server.log"
               node "$BGUTIL_SERVER_HOME/build/main.js" >"$BGUTIL_SERVER_LOG" 2>&1 &
               BGUTIL_SERVER_PID=$!
               sleep 2
               if kill -0 "$BGUTIL_SERVER_PID" 2>/dev/null; then
-                :
+                echo "Using bgutil HTTP provider: $BGUTIL_BASE_URL (pid=$BGUTIL_SERVER_PID)"
               else
                 BGUTIL_SERVER_PID=""
                 echo "bgutil HTTP provider did not start; falling back to script provider"
               fi
             fi
+          fi
+          if [ -n "$YOUTUBE_PO_TOKEN" ]; then
+            echo "Using YOUTUBE_PO_TOKEN secret for yt-dlp"
           fi
 
           maybe_start_warp_proxy() {
@@ -302,6 +265,7 @@ jobs:
               if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE 'warp=(on|plus)'; then
                 WARP_STARTED=1
                 YTDLP_PROXY_ARGS=(--proxy "socks5://127.0.0.1:1080")
+                echo "WARP proxy active for yt-dlp extractor requests"
                 return 0
               fi
               sleep 5
@@ -318,6 +282,7 @@ jobs:
           if [ -n "$SPOTIFY_CLIENT_ID" ] && [ -n "$SPOTIFY_CLIENT_SECRET" ]; then
             export SPOTIPY_CLIENT_ID="$SPOTIFY_CLIENT_ID"
             export SPOTIPY_CLIENT_SECRET="$SPOTIFY_CLIENT_SECRET"
+            echo "Using Spotify API credentials from secrets for spotdl"
           else
             echo "No Spotify app credentials configured; spotdl will use shared defaults (can hit 24h rate limits)"
           fi
@@ -523,6 +488,8 @@ jobs:
             if aria2c -q --connect-timeout=10 --timeout=30 \
               --max-connection-per-server=4 \
               --file-allocation=falloc \
+              --continue=false \
+              --max-tries=1 \
               --dir="$tmp_dir" \
               "$extracted_url" 2>/dev/null; then
               local downloaded_file
@@ -617,7 +584,7 @@ jobs:
             if [ "$rate_limit_detected" -eq 1 ] || grep -qiE 'rate/request limit|retry will occur after|429' "$spotdl_log" 2>/dev/null; then
               echo "Spotify API rate limit hit for this runner/session"
               if [ -z "$SPOTIFY_CLIENT_ID" ] || [ -z "$SPOTIFY_CLIENT_SECRET" ]; then
-                echo "Configure SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET secrets to avoid shared default app limits"
+                echo "Configure SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET (or SPOTDL_CLIENT_ID + SPOTDL_CLIENT_SECRET) secrets to avoid shared default app limits"
               fi
             fi
             if [ "$timed_out" -eq 1 ]; then
@@ -683,7 +650,7 @@ jobs:
                 audio_codec="flac"
                 ;;
               *)
-                ytdlp_format="bestvideo*[height<=${VIDEO_QUALITY}]+bestaudio/best[height<=${VIDEO_QUALITY}]/best"
+                ytdlp_format="$relaxed_format"
                 merge_format="mp4"
                 ;;
             esac
@@ -712,9 +679,10 @@ jobs:
                 --no-playlist
                 --js-runtimes "$YTDLP_JS_RUNTIMES"
                 --remote-components ejs:npm
-                --retries 5
-                --fragment-retries 5
-                --file-access-retries 5
+                --no-continue
+                --retries 1
+                --fragment-retries 1
+                --file-access-retries 1
               )
 
               if [ -n "$fmt" ]; then
@@ -817,12 +785,12 @@ jobs:
           import sys
           import urllib.request
           import xml.etree.ElementTree as ET
-
+          
           url = sys.argv[1]
           request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
           with urllib.request.urlopen(request, timeout=30) as response:
               data = response.read()
-
+          
           root = ET.fromstring(data)
           ns = {
               "atom": "http://www.w3.org/2005/Atom",
@@ -830,12 +798,12 @@ jobs:
               "itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd",
           }
           seen = set()
-
+          
           def emit(value):
               if value and value.startswith(("http://", "https://")) and value not in seen:
                   seen.add(value)
                   print(value)
-
+          
           for item in root.findall(".//item"):
               for enclosure in item.findall("enclosure"):
                   emit(enclosure.attrib.get("url"))
@@ -845,7 +813,7 @@ jobs:
                   link = item.find("link")
                   if link is not None:
                       emit((link.text or "").strip())
-
+          
           for entry in root.findall(".//atom:entry", ns):
               found_enclosure = False
               for link in entry.findall("atom:link", ns):
@@ -954,10 +922,6 @@ jobs:
             if ! wait "$pid"; then
               URL_FAILS=$((URL_FAILS + 1))
               echo "A download worker failed (failures: $URL_FAILS)"
-              if [ "$FAIL_FAST_AFTER" -gt 0 ] && [ "$URL_FAILS" -ge "$FAIL_FAST_AFTER" ]; then
-                echo "Fail-fast threshold reached"
-                exit 1
-              fi
             fi
           }
 
@@ -1066,9 +1030,8 @@ jobs:
                   fi
                   echo "Downloading $CANDIDATE_URL -> $FINAL_FILENAME"
                   if aria2c \
-                    --continue=true \
-                    --retry-wait=2 \
-                    --max-tries=5 \
+                    --continue=false \
+                    --max-tries=1 \
                     --split="$DL_CONNECTIONS" \
                     --max-connection-per-server="$DL_CONNECTIONS" \
                     --min-split-size=5M \
@@ -1193,101 +1156,14 @@ jobs:
               SITE_DIR=$(dirname "$(dirname "$FILE")")
 
               if [ "$SPLIT_THRESHOLD_BYTES" -gt 0 ] && [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
-                echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting into ${SPLIT_THRESHOLD_MB}MB parts (zip-split)"
+                echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting into ${SPLIT_THRESHOLD_MB}MB parts (zip-split)"
                 zip -0 "${ZIP_SECURITY_ARGS[@]}" -s "${SPLIT_THRESHOLD_MB}m" "$SITE_DIR/${BASENAME}.zip" -j "$FILE"
+                echo "Parts: $(ls "$SITE_DIR/${BASENAME}.z"* 2>/dev/null | wc -l)"
               else
                 mv "$FILE" "$SITE_DIR/$BASENAME"
               fi
             done
             find "$USER_ROOT" -type d -name ".tmp_parts" -exec rm -rf {} +
-          fi
-
-          ZIP_GROUP_THRESHOLD=${ZIP_GROUP_THRESHOLD:-15}
-          if [ "$PACKAGE_OUTPUT" = "site-zip" ]; then
-            for site in "${UNIQUE_SITES[@]}"; do
-              SITE_DIR="${SITE_DIRS[$site]}"
-              [ -d "$SITE_DIR" ] || continue
-              SITE_BASENAME=$(basename "$SITE_DIR")
-              ZIP_PATH="${SITE_DIR}.zip"
-              echo "Packing site folder: $SITE_BASENAME -> $(basename "$ZIP_PATH")"
-              (
-                cd "$USER_ROOT"
-
-                SITE_FILE_COUNT=$(find "$SITE_BASENAME" -type f 2>/dev/null | wc -l || true)
-                if [ "$SITE_FILE_COUNT" -le 1 ]; then
-                  echo "Skipping site zip for $SITE_BASENAME (only $SITE_FILE_COUNT file)"
-                  exit 0
-                fi
-
-                MEDIA_EXT_PATTERNS=("*.mp4" "*.mkv" "*.mp3" "*.flac" "*.wav" "*.webm" "*.avi" "*.mov" "*.m4a" "*.aac")
-                TEXT_EXT_PATTERNS=("*.txt" "*.md" "*.csv" "*.log")
-
-                TXT_COUNT=$(find "$SITE_BASENAME" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) 2>/dev/null | wc -l || true)
-                MEDIA_COUNT=$(find "$SITE_BASENAME" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) 2>/dev/null | wc -l || true)
-
-                EXCLUDE_ARGS=()
-                for pat in "${MEDIA_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
-                if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
-                  for pat in "${TEXT_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
-                fi
-
-                if [ "${#EXCLUDE_ARGS[@]}" -gt 0 ]; then
-                  zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$SITE_BASENAME.zip" "$SITE_BASENAME" "${EXCLUDE_ARGS[@]}"
-                else
-                  zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$SITE_BASENAME.zip" "$SITE_BASENAME"
-                fi
-
-                if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
-                  echo "Creating text zip for $SITE_BASENAME (count=$TXT_COUNT)"
-                  find "$SITE_BASENAME" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) -print | zip -@ -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${SITE_BASENAME}_text.zip"
-                fi
-
-                if [ "$MEDIA_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
-                  echo "Creating media zip for $SITE_BASENAME (count=$MEDIA_COUNT); storing files uncompressed inside zip"
-                  find "$SITE_BASENAME" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) -print | zip -@ -0 -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${SITE_BASENAME}_media.zip"
-                fi
-              )
-            done
-          elif [ "$PACKAGE_OUTPUT" = "user-zip" ]; then
-            USER_ARCHIVE="downloads/${ACTOR_SAFE}_downloads_$(date +%Y%m%d_%H%M%S).zip"
-            echo "Packing user folder: $(basename "$USER_ROOT") -> $(basename "$USER_ARCHIVE")"
-            (
-              cd downloads
-
-              USER_FILE_COUNT=$(find "$(basename "$USER_ROOT")" -type f 2>/dev/null | wc -l || true)
-              if [ "$USER_FILE_COUNT" -le 1 ]; then
-                echo "Skipping user zip (only $USER_FILE_COUNT file)"
-                exit 0
-              fi
-
-              MEDIA_EXT_PATTERNS=("*.mp4" "*.mkv" "*.mp3" "*.flac" "*.wav" "*.webm" "*.avi" "*.mov" "*.m4a" "*.aac")
-              TEXT_EXT_PATTERNS=("*.txt" "*.md" "*.csv" "*.log")
-
-              TXT_COUNT=$(find "$(basename "$USER_ROOT")" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) 2>/dev/null | wc -l || true)
-              MEDIA_COUNT=$(find "$(basename "$USER_ROOT")" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) 2>/dev/null | wc -l || true)
-
-              EXCLUDE_ARGS=()
-              for pat in "${MEDIA_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
-              if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
-                for pat in "${TEXT_EXT_PATTERNS[@]}"; do EXCLUDE_ARGS+=("-x" "$pat"); done
-              fi
-
-              if [ "${#EXCLUDE_ARGS[@]}" -gt 0 ]; then
-                zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$(basename "$USER_ARCHIVE")" "$(basename "$USER_ROOT")" "${EXCLUDE_ARGS[@]}"
-              else
-                zip -r -q -9 "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "$(basename "$USER_ARCHIVE")" "$(basename "$USER_ROOT")"
-              fi
-
-              if [ "$TXT_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
-                echo "Creating text zip for user (count=$TXT_COUNT)"
-                find "$(basename "$USER_ROOT")" -type f \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.log' \) -print | zip -@ -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${ACTOR_SAFE}_text.zip"
-              fi
-
-              if [ "$MEDIA_COUNT" -ge "$ZIP_GROUP_THRESHOLD" ]; then
-                echo "Creating media zip for user (count=$MEDIA_COUNT); storing files uncompressed inside zip"
-                find "$(basename "$USER_ROOT")" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.m4a' -o -iname '*.aac' \) -print | zip -@ -0 -q "${ZIP_SECURITY_ARGS[@]}" "${ZIP_SPLIT_ARGS[@]}" "${ACTOR_SAFE}_media.zip"
-              fi
-            )
           fi
 
           while IFS= read -r OVERSIZED; do
@@ -1309,17 +1185,6 @@ jobs:
               rm -f "$OVERSIZED"
             fi
           done < <(find "$USER_ROOT" -type f -size +${GITHUB_MAX_FILE_MB}M)
-
-          if [ "$CLEANUP_MODE" = "archives-only" ]; then
-            echo "Cleanup: keeping only archive files"
-            find "$USER_ROOT" -type f | while IFS= read -r F; do
-              case "$F" in
-                *.zip|*.z[0-9][0-9]|*.z[0-9][0-9][0-9]) ;;
-                *) rm -f "$F" ;;
-              esac
-            done
-            find "$USER_ROOT" -type d -empty -delete
-          fi
 
           for FILE in "${NEW_FILES[@]}"; do
             [ -f "$FILE" ] || continue
@@ -1378,7 +1243,7 @@ jobs:
           BATCH_NUM=0
 
           if ! git pull --rebase --autostash origin "$BRANCH"; then
-            echo "Rebase against origin/$BRANCH failed - aborting so we don't commit on top of a broken rebase"
+            echo "Rebase against origin/$BRANCH failed — aborting so we don't commit on top of a broken rebase"
             exit 1
           fi
 
@@ -1389,7 +1254,7 @@ jobs:
             echo "Pushing batch $BATCH_NUM: files $((i+1))–$(( i + ${#BATCH[@]} )) of $TOTAL"
 
             git add "${BATCH[@]}"
-            git -c user.name="$COMMITTER" -c user.email="${COMMITTER}@users.noreply.github.com" commit -m "Add downloaded files - batch $BATCH_NUM [skip ci]"
+            git -c user.name="$COMMITTER" -c user.email="${COMMITTER}@users.noreply.github.com" commit -m "Add downloaded files — batch $BATCH_NUM [skip ci]"
             echo "Batch $BATCH_NUM committed locally"
           done
 
